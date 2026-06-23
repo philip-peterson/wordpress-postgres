@@ -5,12 +5,19 @@ DB     := wordpress
 DBUSER := wordpress
 DBPASS := wordpress
 
-.PHONY: build up down logs shell db-shell clean wp-config
+.PHONY: build build-assets up down logs shell db-shell clean wp-config
 
 build:
 	podman build -t $(IMAGE) .
 
-up: build
+build-assets:
+	podman run --rm \
+		-v $(CURDIR)/wordpress-develop:/wordpress:Z \
+		-w /wordpress \
+		node:20-alpine \
+		sh -c "npm ci && npm run build:dev"
+
+up: build build-assets
 	podman pod exists $(POD) && podman pod rm -f $(POD) || true
 	podman pod create --name $(POD) -p $(PORT):80
 	podman run -d --pod $(POD) --name $(POD)-db \
@@ -47,8 +54,14 @@ wp-config:
 		-e "s/username_here/$(DBUSER)/" \
 		-e "s/password_here/$(DBPASS)/" \
 		-e "s/localhost/127.0.0.1/" \
+		-e "s/utf8mb4/utf8/" \
+		-e "s/define( 'WP_DEBUG', false );/define( 'WP_DEBUG', true );/" \
 		wordpress-develop/src/wp-config.php
-	@echo "wp-config.php written. Open it to add your secret keys."
+	@# Insert DB_DRIVER right after the "Add any custom values" comment block.
+	sed -i '' \
+		-e "s|/\* Add any custom values between this line.*\*/|& \ndefine( 'DB_DRIVER', 'WP_DB_Driver_PgSQL' );|" \
+		wordpress-develop/src/wp-config.php
+	@echo "wp-config.php written to wordpress-develop/src/wp-config.php"
 
 clean: down
 	podman volume rm wordpress-pgdata 2>/dev/null || true

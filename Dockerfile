@@ -1,5 +1,6 @@
 FROM php:8.2-fpm-alpine
 
+# PHP extensions required by WordPress + PostgreSQL
 RUN apk add --no-cache \
         postgresql-dev \
         libpng-dev \
@@ -21,6 +22,7 @@ RUN apk add --no-cache \
 
 COPY wordpress-develop/tools/local-env/php-config.ini /usr/local/etc/php/conf.d/wordpress.ini
 
+# Source is mounted at runtime via a Podman pod volume; see Makefile.
 WORKDIR /var/www
 
 EXPOSE 9000
