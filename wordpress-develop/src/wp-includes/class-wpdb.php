@@ -36,6 +36,10 @@ define( 'ARRAY_A', 'ARRAY_A' );
  */
 define( 'ARRAY_N', 'ARRAY_N' );
 
+require_once __DIR__ . '/class-wp-db-driver.php';
+require_once __DIR__ . '/class-wp-db-driver-mysqli.php';
+require_once __DIR__ . '/class-wp-db-driver-pgsql.php';
+
 /**
  * WordPress database access abstraction class.
  *
@@ -705,6 +709,19 @@ class wpdb {
 	private $use_mysqli = true;
 
 	/**
+	 * Active database driver instance.
+	 *
+	 * Instantiated in db_connect() based on the DB_DRIVER constant
+	 * (defaults to WP_DB_Driver_MySQLi). All low-level database calls are
+	 * delegated to this object instead of calling mysqli_* functions directly.
+	 *
+	 * @since 6.8.0
+	 *
+	 * @var WP_DB_Driver|null
+	 */
+	protected ?WP_DB_Driver $driver = null;
+
+	/**
 	 * Whether we've managed to successfully connect at some point.
 	 *
 	 * @since 3.9.0
@@ -879,7 +896,7 @@ class wpdb {
 	 * }
 	 */
 	public function determine_charset( $charset, $collate ) {
-		if ( ( ! ( $this->dbh instanceof mysqli ) ) || empty( $this->dbh ) ) {
+		if ( ! $this->driver || ! $this->driver->is_connected() ) {
 			return compact( 'charset', 'collate' );
 		}
 
@@ -923,8 +940,8 @@ class wpdb {
 		if ( $this->has_cap( 'collation' ) && ! empty( $charset ) ) {
 			$set_charset_succeeded = true;
 
-			if ( function_exists( 'mysqli_set_charset' ) && $this->has_cap( 'set_charset' ) ) {
-				$set_charset_succeeded = mysqli_set_charset( $dbh, $charset );
+			if ( $this->driver && $this->has_cap( 'set_charset' ) ) {
+				$set_charset_succeeded = $this->driver->set_charset( $charset );
 			}
 
 			if ( $set_charset_succeeded ) {
@@ -932,7 +949,7 @@ class wpdb {
 				if ( ! empty( $collate ) ) {
 					$query .= $this->prepare( ' COLLATE %s', $collate );
 				}
-				mysqli_query( $dbh, $query );
+				$this->driver && $this->driver->query( $query );
 			}
 		}
 	}
@@ -948,13 +965,11 @@ class wpdb {
 	 */
 	public function set_sql_mode( $modes = array() ) {
 		if ( empty( $modes ) ) {
-			$res = mysqli_query( $this->dbh, 'SELECT @@SESSION.sql_mode' );
-
-			if ( empty( $res ) ) {
+			if ( ! $this->driver->query( 'SELECT @@SESSION.sql_mode' ) || ! $this->driver->has_result() ) {
 				return;
 			}
 
-			$modes_array = mysqli_fetch_array( $res );
+			$modes_array = $this->driver->fetch_array();
 
 			if ( empty( $modes_array[0] ) ) {
 				return;
@@ -982,7 +997,7 @@ class wpdb {
 
 		$modes_str = implode( ',', $modes );
 
-		mysqli_query( $this->dbh, "SET SESSION sql_mode='$modes_str'" );
+		$this->driver->query( "SET SESSION sql_mode='$modes_str'" );
 	}
 
 	/**
@@ -1194,7 +1209,7 @@ class wpdb {
 			$dbh = $this->dbh;
 		}
 
-		$success = mysqli_select_db( $dbh, $db );
+		$success = $this->driver->select_db( $db );
 
 		if ( ! $success ) {
 			$this->ready = false;
@@ -1273,8 +1288,8 @@ class wpdb {
 			return '';
 		}
 
-		if ( $this->dbh ) {
-			$escaped = mysqli_real_escape_string( $this->dbh, $data );
+		if ( $this->driver && $this->driver->is_connected() ) {
+			$escaped = $this->driver->escape( $data );
 		} else {
 			$class = get_class( $this );
 
@@ -1800,7 +1815,7 @@ class wpdb {
 		global $EZSQL_ERROR;
 
 		if ( ! $str ) {
-			$str = mysqli_error( $this->dbh );
+			$str = $this->driver ? $this->driver->last_error() : '';
 		}
 
 		$EZSQL_ERROR[] = array(
@@ -1926,18 +1941,17 @@ class wpdb {
 		$this->num_rows      = 0;
 		$this->last_error    = '';
 
-		if ( $this->result instanceof mysqli_result ) {
-			mysqli_free_result( $this->result );
+		if ( $this->driver && $this->driver->has_result() ) {
+			$this->driver->free_result();
 			$this->result = null;
 
-			// Confidence check before using the handle.
-			if ( empty( $this->dbh ) || ! ( $this->dbh instanceof mysqli ) ) {
+			if ( ! $this->driver->is_connected() ) {
 				return;
 			}
 
 			// Clear out any results from a multi-query.
-			while ( mysqli_more_results( $this->dbh ) ) {
-				mysqli_next_result( $this->dbh );
+			while ( $this->driver->more_results() ) {
+				$this->driver->next_result();
 			}
 		}
 	}
@@ -1955,17 +1969,6 @@ class wpdb {
 	 */
 	public function db_connect( $allow_bail = true ) {
 		$this->is_mysql = true;
-
-		$client_flags = defined( 'MYSQL_CLIENT_FLAGS' ) ? MYSQL_CLIENT_FLAGS : 0;
-
-		/*
-		 * Switch error reporting off because WordPress handles its own.
-		 * This is due to the default value change from `MYSQLI_REPORT_OFF`
-		 * to `MYSQLI_REPORT_ERROR|MYSQLI_REPORT_STRICT` in PHP 8.1.
-		 */
-		mysqli_report( MYSQLI_REPORT_OFF );
-
-		$this->dbh = mysqli_init();
 
 		$host    = $this->dbhost;
 		$port    = null;
@@ -1986,15 +1989,15 @@ class wpdb {
 			$host = "[$host]";
 		}
 
-		if ( WP_DEBUG ) {
-			mysqli_real_connect( $this->dbh, $host, $this->dbuser, $this->dbpassword, null, $port, $socket, $client_flags );
-		} else {
-			// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-			@mysqli_real_connect( $this->dbh, $host, $this->dbuser, $this->dbpassword, null, $port, $socket, $client_flags );
-		}
+		$client_flags = defined( 'MYSQL_CLIENT_FLAGS' ) ? MYSQL_CLIENT_FLAGS : 0;
+		$driver_class = defined( 'DB_DRIVER' ) ? DB_DRIVER : 'WP_DB_Driver_MySQLi';
+		$this->driver = new $driver_class();
 
-		if ( $this->dbh->connect_errno ) {
-			$this->dbh = null;
+		$connected = $this->driver->connect( $host, $port, $socket, $this->dbuser, $this->dbpassword, $client_flags, $this->dbname );
+
+		if ( ! $connected ) {
+			$this->dbh    = null;
+			$this->driver = null;
 		}
 
 		if ( ! $this->dbh && $allow_bail ) {
@@ -2030,7 +2033,11 @@ class wpdb {
 			$this->bail( $message, 'db_connect_fail' );
 
 			return false;
-		} elseif ( $this->dbh ) {
+		} elseif ( $connected ) {
+			// Keep $this->dbh as a truthy sentinel for back-compat; the
+			// real connection handle lives inside $this->driver.
+			$this->dbh = true;
+
 			if ( ! $this->has_connected ) {
 				$this->init_charset();
 			}
@@ -2123,7 +2130,7 @@ class wpdb {
 	 */
 	public function check_connection( $allow_bail = true ) {
 		// Check if the connection is alive.
-		if ( ! empty( $this->dbh ) && mysqli_query( $this->dbh, 'DO 1' ) !== false ) {
+		if ( $this->driver && $this->driver->is_connected() && $this->driver->query( 'DO 1' ) ) {
 			return true;
 		}
 
@@ -2269,17 +2276,17 @@ class wpdb {
 		// Database server has gone away, try to reconnect.
 		$mysql_errno = 0;
 
-		if ( $this->dbh instanceof mysqli ) {
-			$mysql_errno = mysqli_errno( $this->dbh );
+		if ( $this->driver && $this->driver->is_connected() ) {
+			$mysql_errno = $this->driver->last_errno();
 		} else {
 			/*
-			 * $dbh is defined, but isn't a real connection.
-			 * Something has gone horribly wrong, let's try a reconnect.
+			 * Driver is not connected. Something has gone horribly wrong;
+			 * set the "gone away" errno so we attempt a reconnect below.
 			 */
 			$mysql_errno = 2006;
 		}
 
-		if ( empty( $this->dbh ) || 2006 === $mysql_errno ) {
+		if ( ! $this->driver || ! $this->driver->is_connected() || 2006 === $mysql_errno ) {
 			if ( $this->check_connection() ) {
 				$this->_do_query( $query );
 			} else {
@@ -2289,8 +2296,8 @@ class wpdb {
 		}
 
 		// If there is an error then take note of it.
-		if ( $this->dbh instanceof mysqli ) {
-			$this->last_error = mysqli_error( $this->dbh );
+		if ( $this->driver ) {
+			$this->last_error = $this->driver->last_error();
 		} else {
 			$this->last_error = __( 'Unable to retrieve the error message from the database server' );
 		}
@@ -2308,11 +2315,11 @@ class wpdb {
 		if ( preg_match( '/^\s*(create|alter|truncate|drop)\s/i', $query ) ) {
 			$return_val = $this->result;
 		} elseif ( preg_match( '/^\s*(insert|delete|update|replace)\s/i', $query ) ) {
-			$this->rows_affected = mysqli_affected_rows( $this->dbh );
+			$this->rows_affected = $this->driver->affected_rows();
 
 			// Take note of the insert_id.
 			if ( preg_match( '/^\s*(insert|replace)\s/i', $query ) ) {
-				$this->insert_id = mysqli_insert_id( $this->dbh );
+				$this->insert_id = $this->driver->insert_id();
 			}
 
 			// Return number of rows affected.
@@ -2320,8 +2327,8 @@ class wpdb {
 		} else {
 			$num_rows = 0;
 
-			if ( $this->result instanceof mysqli_result ) {
-				while ( $row = mysqli_fetch_object( $this->result ) ) {
+			if ( $this->driver->has_result() ) {
+				while ( $row = $this->driver->fetch_object() ) {
 					$this->last_result[ $num_rows ] = $row;
 					++$num_rows;
 				}
@@ -2349,8 +2356,8 @@ class wpdb {
 			$this->timer_start();
 		}
 
-		if ( ! empty( $this->dbh ) ) {
-			$this->result = mysqli_query( $this->dbh, $query );
+		if ( $this->driver ) {
+			$this->result = $this->driver->query( $query );
 		}
 
 		++$this->num_queries;
@@ -3725,7 +3732,7 @@ class wpdb {
 					if ( $this->charset ) {
 						$connection_charset = $this->charset;
 					} else {
-						$connection_charset = mysqli_character_set_name( $this->dbh );
+						$connection_charset = $this->driver->charset_name();
 					}
 
 					if ( is_array( $value['length'] ) ) {
@@ -3938,10 +3945,10 @@ class wpdb {
 			return;
 		}
 
-		$num_fields = mysqli_num_fields( $this->result );
+		$num_fields = $this->driver->num_fields();
 
 		for ( $i = 0; $i < $num_fields; $i++ ) {
-			$this->col_info[ $i ] = mysqli_fetch_field( $this->result );
+			$this->col_info[ $i ] = $this->driver->fetch_field();
 		}
 	}
 
@@ -4016,10 +4023,10 @@ class wpdb {
 		if ( $this->show_errors ) {
 			$error = '';
 
-			if ( $this->dbh instanceof mysqli ) {
-				$error = mysqli_error( $this->dbh );
-			} elseif ( mysqli_connect_errno() ) {
-				$error = mysqli_connect_error();
+			if ( $this->driver && $this->driver->is_connected() ) {
+				$error = $this->driver->last_error();
+			} elseif ( $this->driver && $this->driver->connect_errno() ) {
+				$error = $this->driver->connect_error();
 			}
 
 			if ( $error ) {
@@ -4051,9 +4058,10 @@ class wpdb {
 			return false;
 		}
 
-		$closed = mysqli_close( $this->dbh );
+		$closed = $this->driver->close();
 
 		if ( $closed ) {
+			$this->driver        = null;
 			$this->dbh           = null;
 			$this->ready         = false;
 			$this->has_connected = false;
@@ -4216,6 +4224,6 @@ class wpdb {
 	 * @return string Database server version as a string.
 	 */
 	public function db_server_info() {
-		return mysqli_get_server_info( $this->dbh );
+		return $this->driver ? $this->driver->server_info() : '';
 	}
 }
