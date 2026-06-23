@@ -1995,7 +1995,11 @@ class wpdb {
 
 		$connected = $this->driver->connect( $host, $port, $socket, $this->dbuser, $this->dbpassword, $client_flags, $this->dbname );
 
-		if ( ! $connected ) {
+		if ( $connected ) {
+			// Truthy sentinel — keeps back-compat checks like `if ($wpdb->dbh)` working.
+			// The real connection handle lives in $this->driver.
+			$this->dbh = true;
+		} else {
 			$this->dbh    = null;
 			$this->driver = null;
 		}
@@ -2034,10 +2038,6 @@ class wpdb {
 
 			return false;
 		} elseif ( $connected ) {
-			// Keep $this->dbh as a truthy sentinel for back-compat; the
-			// real connection handle lives inside $this->driver.
-			$this->dbh = true;
-
 			if ( ! $this->has_connected ) {
 				$this->init_charset();
 			}
