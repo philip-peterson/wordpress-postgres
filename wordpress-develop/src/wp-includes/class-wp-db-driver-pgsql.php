@@ -193,7 +193,21 @@ class WP_DB_Driver_PgSQL implements WP_DB_Driver {
 			return null;
 		}
 		$row = $this->stmt->fetch( PDO::FETCH_OBJ );
-		return $row ?: null;
+		if ( ! $row ) {
+			return null;
+		}
+		// wp_users / wp_posts define their PK as `ID` (uppercase) without backticks.
+		// PostgreSQL folds unquoted DDL identifiers to lowercase, so the column
+		// lands as "id". WordPress accesses it as ->ID, so alias it back.
+		if ( isset( $row->id ) && ! isset( $row->ID ) ) {
+			$row->ID = $row->id;
+		}
+		// wp_comments defines its PK as `comment_ID` (mixed case, no backticks).
+		// Same fold: stored as "comment_id", accessed by WordPress as ->comment_ID.
+		if ( isset( $row->comment_id ) && ! isset( $row->comment_ID ) ) {
+			$row->comment_ID = $row->comment_id;
+		}
+		return $row;
 	}
 
 	public function fetch_array(): array|false {
@@ -201,7 +215,17 @@ class WP_DB_Driver_PgSQL implements WP_DB_Driver {
 			return false;
 		}
 		$row = $this->stmt->fetch( PDO::FETCH_BOTH );
-		return $row !== false ? $row : false;
+		if ( $row === false ) {
+			return false;
+		}
+		// Same case-fold aliasing as fetch_object() — see comments there.
+		if ( isset( $row['id'] ) && ! isset( $row['ID'] ) ) {
+			$row['ID'] = $row['id'];
+		}
+		if ( isset( $row['comment_id'] ) && ! isset( $row['comment_ID'] ) ) {
+			$row['comment_ID'] = $row['comment_id'];
+		}
+		return $row;
 	}
 
 	public function has_result(): bool { return $this->stmt !== null; }
@@ -543,11 +567,20 @@ class WP_DB_Driver_PgSQL implements WP_DB_Driver {
 		}
 		$table = $tm[1];
 
+		// Extract the INSERT column list so we can pick the right conflict index.
+		$insert_cols = [];
+		if ( preg_match( '/\(([^)]+)\)\s+VALUES/i', $insert_part, $cm ) ) {
+			$insert_cols = array_map(
+				fn( $c ) => strtolower( trim( str_replace( '"', '', $c ) ) ),
+				$this->split_top_level( $cm[1] )
+			);
+		}
+
 		// Translate VALUES(col) → EXCLUDED.col in the SET list.
 		$set_clauses = $this->translate_duplicate_set( $update_part );
 
-		// Resolve conflict target from the live schema.
-		$conflict_cols = $this->unique_key_columns( $table );
+		// Find the unique index whose columns are all present in the INSERT list.
+		$conflict_cols = $this->find_conflict_index( $table, $insert_cols );
 
 		if ( empty( $conflict_cols ) || empty( $set_clauses ) ) {
 			return $insert_part . ' ON CONFLICT DO NOTHING';
@@ -585,37 +618,61 @@ class WP_DB_Driver_PgSQL implements WP_DB_Driver {
 	}
 
 	/**
-	 * Returns columns of the first primary or unique index on $table.
+	 * Finds the unique/primary index on $table whose columns are all present in $insert_cols.
 	 *
-	 * Cached per request; prefers primary key over unique indexes.
+	 * MySQL's ON DUPLICATE KEY UPDATE fires on any unique constraint, but PostgreSQL's
+	 * ON CONFLICT requires naming one specific index. We pick the index whose columns are
+	 * a subset of what is being inserted, preferring the primary key.
 	 *
-	 * @param string $table Unquoted table name.
-	 * @return string[] Double-quoted column names, or [] if none found.
+	 * @param string   $table       Unquoted table name.
+	 * @param string[] $insert_cols Lowercased column names from the INSERT list.
+	 * @return string[] Double-quoted column names of the matching index, or [] if none.
 	 */
-	private function unique_key_columns( string $table ): array {
+	private function find_conflict_index( string $table, array $insert_cols ): array {
 		static $cache = [];
 
-		if ( array_key_exists( $table, $cache ) ) {
-			return $cache[ $table ];
+		if ( ! array_key_exists( $table, $cache ) ) {
+			try {
+				// Fetch each unique/primary index as a group, primary key first.
+				$s = $this->pdo->query( "
+					SELECT i.indexrelid, i.indisprimary, a.attname
+					  FROM pg_index     i
+					  JOIN pg_attribute a ON a.attrelid = i.indrelid
+					                    AND a.attnum    = ANY( i.indkey )
+					 WHERE i.indrelid = " . $this->pdo->quote( $table ) . "::regclass
+					   AND ( i.indisprimary OR i.indisunique )
+					 ORDER BY i.indisprimary DESC, i.indexrelid, a.attnum
+				" );
+				$rows = $s ? $s->fetchAll( PDO::FETCH_ASSOC ) : [];
+			} catch ( PDOException $e ) {
+				$rows = [];
+			}
+
+			// Group columns by index OID.
+			$indexes = [];
+			foreach ( $rows as $row ) {
+				$indexes[ $row['indexrelid'] ][] = $row['attname'];
+			}
+			$cache[ $table ] = array_values( $indexes );
 		}
 
-		try {
-			$s = $this->pdo->query( "
-				SELECT a.attname
-				  FROM pg_index     i
-				  JOIN pg_attribute a ON a.attrelid = i.indrelid
-				                    AND a.attnum    = ANY( i.indkey )
-				 WHERE i.indrelid = " . $this->pdo->quote( $table ) . "::regclass
-				   AND ( i.indisprimary OR i.indisunique )
-				 ORDER BY i.indisprimary DESC, i.indkey::text, a.attnum
-			" );
-			$cols = $s ? $s->fetchAll( PDO::FETCH_COLUMN ) : [];
-		} catch ( PDOException $e ) {
-			$cols = [];
+		$insert_set = array_flip( $insert_cols );
+
+		// Return columns of the first index all of whose columns appear in the INSERT list.
+		foreach ( $cache[ $table ] as $cols ) {
+			$all_present = true;
+			foreach ( $cols as $col ) {
+				if ( ! isset( $insert_set[ strtolower( $col ) ] ) ) {
+					$all_present = false;
+					break;
+				}
+			}
+			if ( $all_present ) {
+				return array_map( fn( $c ) => "\"$c\"", $cols );
+			}
 		}
 
-		$cache[ $table ] = array_map( fn( $c ) => "\"$c\"", $cols );
-		return $cache[ $table ];
+		return [];
 	}
 
 	/**
